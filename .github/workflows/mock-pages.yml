@@ -1,0 +1,116 @@
+# 紙芝居（/mock）の公開と停止。tateaki196/mock リポジトリに置く。
+# 正本は ikusei リポジトリの scripts/mock_pages_repo/（publish_mock.py がここへ写す）。ここを直接直さない。
+#
+# 使い方（Actions の画面）：「mock の公開・停止」→ Run workflow → 公開 か 停止 を選ぶ。
+#   公開：site/（手元で最後に組み立てて送った紙芝居）を出す。止める日を入れると、その日の朝に自動で止める。
+#   停止：「いまは公開を止めています」の1枚に差し替える（URL は変わらない）。
+# 毎日 0:10（日本時間）に、止める日が来ていないかを見る。
+name: mock の公開・停止
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "公開 か 停止"
+        type: choice
+        options: ["公開", "停止"]
+        default: "公開"
+      stop_date:
+        description: "（公開のとき・任意）止める日 YYYY-MM-DD。この日の0:10（日本時間）に自動で止める。空なら止めない"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths: ["site/**", "stopped/**"]
+  schedule:
+    - cron: "10 15 * * *"   # 毎日 15:10 UTC＝0:10 JST
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: mock-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: いまの状態を決める
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_ACTION: ${{ inputs.action }}
+          IN_STOP: ${{ inputs.stop_date }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, datetime
+          p = "state.json"
+          st = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {"mode": "停止", "stop_date": ""}
+          today = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).date().isoformat()
+          ev = os.environ["EVENT"]
+          note = ""
+          if ev == "workflow_dispatch":
+              st["mode"] = os.environ["IN_ACTION"]
+              sd = os.environ.get("IN_STOP", "").strip()
+              if st["mode"] == "公開":
+                  if sd and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", sd):
+                      raise SystemExit(f"止める日の書き方が違います（YYYY-MM-DD）: {sd}")
+                  if sd and sd <= today:
+                      raise SystemExit(f"止める日が今日以前です: {sd}（今日 {today}）")
+                  st["stop_date"] = sd
+              else:
+                  st["stop_date"] = ""
+              note = f"手動で{st['mode']}"
+          elif ev == "schedule":
+              if st.get("mode") == "公開" and st.get("stop_date") and st["stop_date"] <= today:
+                  st["mode"], note = "停止", f"止める日（{st['stop_date']}）が来たので停止"
+                  st["stop_date"] = ""
+              else:
+                  note = "変更なし"
+          else:
+              note = "紙芝居の更新を受けて、いまの状態で出し直し"
+          st["updated"] = today
+          json.dump(st, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"mode={st['mode']}\nnote={note}\nchanged={'0' if note == '変更なし' else '1'}\n")
+          print(note, st)
+          PY
+
+      - name: 状態を記録する
+        if: steps.decide.outputs.changed == '1'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "mock: ${{ steps.decide.outputs.note }}"
+          git push
+
+      - name: 出すものをそろえる
+        if: steps.decide.outputs.changed == '1'
+        run: |
+          rm -rf _site && mkdir _site
+          if [ "${{ steps.decide.outputs.mode }}" = "公開" ]; then
+            test -f site/index.html || { echo "site/index.html がありません（publish_mock.py で送ってください）"; exit 1; }
+            cp -r site/. _site/
+          else
+            cp -r stopped/. _site/
+          fi
+          printf 'User-agent: *\nDisallow: /\n' > _site/robots.txt
+
+      - uses: actions/configure-pages@v5
+        if: steps.decide.outputs.changed == '1'
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.decide.outputs.changed == '1'
+        with:
+          path: _site
+      - id: deployment
+        if: steps.decide.outputs.changed == '1'
+        uses: actions/deploy-pages@v4
